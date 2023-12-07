@@ -1,7 +1,10 @@
 Library
   structure Direct
   structure Main
+  structure ThreeCPS
 is
   $/basis.cm
+  $/smlnj-lib.cm
   direct.sml
   main.sml
+  threecps.sml
