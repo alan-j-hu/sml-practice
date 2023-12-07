@@ -46,8 +46,12 @@ structure ThreeCPS = struct
     | VCons of value * value
     | VNil
     | VBox of value ref
-    | VClos of ulam * hcenv * scenv
+    | VClos of proc
     | VCont of clam * hcenv * scenv * int
+
+  and proc
+    = Primop of ((value * (value -> unit) * (value -> unit) list) -> unit)
+    | Clos of ulam * hcenv * scenv
 
   type frame = (string * value ref) list
 
@@ -92,7 +96,7 @@ structure ThreeCPS = struct
             | NONE => NONE
 
   fun a_u (Lam(ulam), beta, gamma, machine : machine) =
-      VClos (ulam, beta, gamma)
+      VClos (Clos (ulam, beta, gamma))
     | a_u (Var(UVar v), beta, gamma, machine) =
       case #lifetime v
        of H =>
@@ -194,7 +198,7 @@ structure ThreeCPS = struct
           fun update [] = ()
             | update ((_, r, ulam) :: xs) =
               let
-                  val () = (r := VClos (ulam, beta, gamma))
+                  val () = (r := VClos (Clos (ulam, beta, gamma)))
               in
                   update xs
               end
@@ -203,7 +207,7 @@ structure ThreeCPS = struct
           eval (tail, beta, gamma, replaceRegs(machine, regs))
       end
 
-  and apply_user ((Lambda(l, x, k, ks, pr), beta, gamma), arg, c, cs, machine) =
+  and apply_user (Clos(Lambda(l, x, k, ks, pr), beta, gamma), arg, c, cs, machine) =
       let
           val contour = fresh_contour machine
           val hframe = makeUFrame (fn H => true | _ => false) (x, arg, k, ks, c, cs)
@@ -220,6 +224,10 @@ structure ThreeCPS = struct
       in
           eval (pr, beta, gamma, replaceRegs (machine, regs))
       end
+    | apply_user (Primop f, arg, c, cs, machine) =
+      f (arg,
+         fn v => apply_cont (c, v, machine),
+         List.map (fn c => fn v => apply_cont (c, v, machine)) cs)
 
   and apply_cont ((Cont(l, x, pr), beta, gamma, tos), arg, machine) =
       let

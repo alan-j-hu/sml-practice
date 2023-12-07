@@ -1,6 +1,7 @@
 structure Main =
   struct
     structure Di = Direct
+    structure Cps = ThreeCPS
     fun main (_, _) =
         let
             val res =
