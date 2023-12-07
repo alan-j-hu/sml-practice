@@ -34,6 +34,7 @@ structure ThreeCPS = struct
   and prog
     = UApp of (ulam, uvar) exp * (ulam, uvar) exp * (clam, cvar) exp * (clam, cvar) exp list
     | CApp of (clam, cvar) exp * (ulam, uvar) exp
+    | Letrec of label * (uvar * ulam) list * prog
 
   type hcenv = (label * contour) list
   type scenv = (label * stack_index) list
@@ -67,6 +68,9 @@ structure ThreeCPS = struct
           c
       end
 
+  fun replaceRegs ({gen_contour = gc, registers = _, stack = s, heap = h}, registers) =
+      {gen_contour = gc, registers = registers, stack = s, heap = h}
+
   fun zip ([], []) = []
     | zip (x :: xs, y :: ys) = (x, y) :: zip (xs, ys)
     | zip _ = raise (Eval "Uneven lists")
@@ -77,6 +81,15 @@ structure ThreeCPS = struct
           v
       else
           lookup (xs, var)
+
+  fun lookupOpt ([], var) = NONE
+    | lookupOpt ((k, v) :: xs, var) =
+      if k = var then
+          SOME (v, xs)
+      else
+          case lookupOpt (xs, var)
+           of SOME (v', rest) => SOME (v', (k, v) :: rest)
+            | NONE => NONE
 
   fun a_u (Lam(ulam), beta, gamma, machine : machine) =
       VClos (ulam, beta, gamma)
@@ -129,6 +142,12 @@ structure ThreeCPS = struct
               pairs
       end
 
+  fun overwriteFrame ([], new) = new
+    | overwriteFrame ((var, value) :: xs, new) =
+      case lookupOpt (new, var)
+       of NONE => (var, value) :: overwriteFrame (xs, new)
+        | SOME (value', new) => (var, value') :: overwriteFrame (xs, new)
+
   fun eval (UApp(f, x, q1, qs), beta, gamma, machine) =
     let
         val proc = assert_clos (a_u (f, beta, gamma, machine))
@@ -147,6 +166,42 @@ structure ThreeCPS = struct
       in
           apply_cont (c, arg, machine)
       end
+    | eval (Letrec(l, bindings, tail), beta, gamma, machine) =
+      let
+          val contour = fresh_contour machine
+          val toUpdate = List.map (fn (v, rhs) => (v, ref VNil, rhs)) bindings
+          fun splitHSR [] = ([], [], [])
+            | splitHSR ((tup as (v, refcell, rhs)) :: xs) =
+              let
+                  val (h, s, r) = splitHSR xs
+              in
+                  case #lifetime (unUVar v)
+                   of H => (tup :: h, s, r)
+                    | S => (h, tup :: s, r)
+                    | R => (h, s, tup :: r)
+              end
+          val (h, s, r) = splitHSR toUpdate
+          val hframe = List.map (fn (v, r, _) => (#name (unUVar v), r)) h
+          val beta = (l, contour) :: beta
+          val sframe = List.map (fn (v, r, _) => (#name (unUVar v), r)) s
+          val sz = DynamicArray.bound (#stack machine) + 1
+          val () = DynamicArray.update (#stack machine, sz, SOME sframe)
+          val gamma = (l, sz) :: gamma
+          val regs =
+              overwriteFrame
+                  (#registers machine,
+                   List.map (fn (v, r, _) => (#name (unUVar v), r)) r)
+          fun update [] = ()
+            | update ((_, r, ulam) :: xs) =
+              let
+                  val () = (r := VClos (ulam, beta, gamma))
+              in
+                  update xs
+              end
+          val () = update toUpdate
+      in
+          eval (tail, beta, gamma, replaceRegs(machine, regs))
+      end
 
   and apply_user ((Lambda(l, x, k, ks, pr), beta, gamma), arg, c, cs, machine) =
       let
@@ -158,9 +213,12 @@ structure ThreeCPS = struct
           val sz = DynamicArray.bound (#stack machine) + 1
           val () = DynamicArray.update (#stack machine, sz, SOME sframe)
           val gamma = (l, sz) :: gamma
-          val regs = makeUFrame (fn R => true | _ => false) (x, arg, k, ks, c, cs)
+          val regs =
+              overwriteFrame
+                  (#registers machine,
+                   makeUFrame (fn R => true | _ => false) (x, arg, k, ks, c, cs))
       in
-          eval (pr, beta, gamma, machine)
+          eval (pr, beta, gamma, replaceRegs (machine, regs))
       end
 
   and apply_cont ((Cont(l, x, pr), beta, gamma, tos), arg, machine) =
@@ -183,6 +241,6 @@ structure ThreeCPS = struct
                of R => [(#name (unUVar x), ref arg)]
                 | _ => []
       in
-          eval (pr, beta, gamma, machine)
+          eval (pr, beta, gamma, replaceRegs (machine, regs))
       end
 end
