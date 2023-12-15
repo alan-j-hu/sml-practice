@@ -1,4 +1,8 @@
 structure ThreeCPS = struct
+  datatype empty = Rec of empty
+
+  fun explode (Rec e) = explode e
+
   (* Lexical scope label *)
   type label = int
 
@@ -28,11 +32,11 @@ structure ThreeCPS = struct
 
   datatype ('lam, 'var) exp = Lam of 'lam | Var of 'var
 
-  datatype ulam = Lambda of label * uvar * cvar * cvar list * prog
+  datatype ulam = Lambda of label * uvar list * cvar * cvar list * prog
   and clam = Cont of label * uvar * prog
 
   and prog
-    = UApp of (ulam, uvar) exp * (ulam, uvar) exp * (clam, cvar) exp * (clam, cvar) exp list
+    = UApp of (ulam, uvar) exp * (ulam, uvar) exp list * (clam, cvar) exp * (clam, cvar) exp list
     | CApp of (clam, cvar) exp * (ulam, uvar) exp
     | Letrec of label * (uvar * ulam) list * prog
 
@@ -50,7 +54,7 @@ structure ThreeCPS = struct
     | VCont of clam * hcenv * scenv * int
 
   and proc
-    = Primop of ((value * (value -> unit) * (value -> unit) list) -> unit)
+    = Primop of ((value list * (value -> empty) * (value -> empty) list) -> empty)
     | Clos of ulam * hcenv * scenv
 
   type frame = (string * value ref) list
@@ -132,18 +136,18 @@ structure ThreeCPS = struct
   fun assert_cont (VCont cont) = cont
     | assert_cont _ = raise (Eval "")
 
-  fun makeUFrame pred (x, arg, k, ks, c, cs) =
+  fun makeUFrame pred (xs, args, k, ks, c, cs) =
       let
           val ks = k :: ks
           val cs = c :: cs
-          val pairs = zip (ks, cs)
-          val pairs = List.filter (fn (k, _) => pred (#lifetime (unCVar k))) pairs
-          val pairs = List.map (fn (k, c) => (#name (unCVar k), ref (VCont c))) pairs
+          val conts = zip (ks, cs)
+          val conts = List.filter (fn (k, _) => pred (#lifetime (unCVar k))) conts
+          val conts = List.map (fn (k, c) => (#name (unCVar k), ref (VCont c))) conts
+          val users = zip (xs, args)
+          val users = List.filter (fn (x, _) => pred (#lifetime (unUVar x))) users
+          val users = List.map (fn (x, arg) => (#name (unUVar x), ref arg)) users
       in
-          if pred (#lifetime (unUVar x)) then
-              (#name (unUVar x), ref arg) :: pairs
-          else
-              pairs
+          users @ conts
       end
 
   fun overwriteFrame ([], new) = new
@@ -152,15 +156,15 @@ structure ThreeCPS = struct
        of NONE => (var, value) :: overwriteFrame (xs, new)
         | SOME (value', new) => (var, value') :: overwriteFrame (xs, new)
 
-  fun eval (UApp(f, x, q1, qs), beta, gamma, machine) =
+  fun eval (UApp(f, xs, q1, qs), beta, gamma, machine) : empty =
     let
         val proc = assert_clos (a_u (f, beta, gamma, machine))
-        val arg = a_u (x, beta, gamma, machine)
+        val args = List.map (fn x => a_u (x, beta, gamma, machine)) xs
         val c = assert_cont (a_c (q1, beta, gamma, machine))
         val cs = List.map (fn c => assert_cont (a_c (c, beta, gamma, machine))) qs
         val () = stackTrim (#stack machine, c, cs)
     in
-      apply_user (proc, arg, c, cs, machine)
+      apply_user (proc, args, c, cs, machine)
     end
     | eval (CApp(f, x), beta, gamma, machine) =
       let
@@ -207,29 +211,29 @@ structure ThreeCPS = struct
           eval (tail, beta, gamma, replaceRegs(machine, regs))
       end
 
-  and apply_user (Clos(Lambda(l, x, k, ks, pr), beta, gamma), arg, c, cs, machine) =
+  and apply_user (Clos(Lambda(l, xs, k, ks, pr), beta, gamma), args, c, cs, machine) : empty =
       let
           val contour = fresh_contour machine
-          val hframe = makeUFrame (fn H => true | _ => false) (x, arg, k, ks, c, cs)
+          val hframe = makeUFrame (fn H => true | _ => false) (xs, args, k, ks, c, cs)
           val beta = (l, contour) :: beta
           val () = DynamicArray.update(#heap machine, contour, hframe)
-          val sframe = makeUFrame (fn S => true | _ => false) (x, arg, k, ks, c, cs)
+          val sframe = makeUFrame (fn S => true | _ => false) (xs, args, k, ks, c, cs)
           val sz = DynamicArray.bound (#stack machine) + 1
           val () = DynamicArray.update (#stack machine, sz, SOME sframe)
           val gamma = (l, sz) :: gamma
           val regs =
               overwriteFrame
                   (#registers machine,
-                   makeUFrame (fn R => true | _ => false) (x, arg, k, ks, c, cs))
+                   makeUFrame (fn R => true | _ => false) (xs, args, k, ks, c, cs))
       in
           eval (pr, beta, gamma, replaceRegs (machine, regs))
       end
-    | apply_user (Primop f, arg, c, cs, machine) =
-      f (arg,
+    | apply_user (Primop f, args, c, cs, machine) =
+      f (args,
          fn v => apply_cont (c, v, machine),
          List.map (fn c => fn v => apply_cont (c, v, machine)) cs)
 
-  and apply_cont ((Cont(l, x, pr), beta, gamma, tos), arg, machine) =
+  and apply_cont ((Cont(l, x, pr), beta, gamma, tos), arg, machine) : empty =
       let
           val contour = fresh_contour machine
           val hframe =
@@ -250,5 +254,51 @@ structure ThreeCPS = struct
                 | _ => []
       in
           eval (pr, beta, gamma, replaceRegs (machine, regs))
+      end
+
+val prelude =
+      let
+          fun arithOp f _ ([VInt i, VInt j], c, _) = c (VInt (f (i, j)))
+            | arithOp _ f ([VFloat m, VFloat n], c, _) = c (VFloat (f (m, n)))
+            | arithOp _ f ([VInt i, VFloat n], c, _) = c (VFloat (f (Real.fromInt i, n)))
+            | arithOp _ f ([VFloat n, VInt i], c, _) = c (VFloat (f (n, Real.fromInt i)))
+            | arithOp _ _ ([_, _], _, _) =
+              raise (Eval "Wrong type, expected int * int")
+            | arithOp _ _ _ = raise (Eval "Arity mismatch")
+
+          fun divOp ([VInt i, VInt j], c, _) = c (VFloat (Real.fromInt i / Real.fromInt j))
+            | divOp ([VFloat m, VFloat n], c, _) = c (VFloat (m / n))
+            | divOp ([VInt i, VFloat n], c, _) = c (VFloat (Real.fromInt i / n))
+            | divOp ([VFloat n, VInt i], c, _) = c (VFloat (n / Real.fromInt i))
+            | divOp ([_, _], _, _) =
+              raise (Eval "Wrong type, expected int * int")
+            | divOp _ = raise (Eval "Arity mismatch")
+
+          fun carOp ([VCons (x, _)], c, _) = c x
+            | carOp ([_], _, _) = raise (Eval "Wrong type, expected cons")
+            | carOp _ = raise (Eval "Arity mismatch")
+          fun cdrOp ([VCons (_, xs)], c, _) = c xs
+            | cdrOp ([_], _, _) = raise (Eval "Wrong type, expected cons")
+            | cdrOp _ = raise (Eval "Arity mismatch")
+          fun consOp ([x, xs], c, _) = c (VCons (x, xs))
+            | consOp _ = raise (Eval "Arity mismatch")
+          fun eqOp ([VInt i, VInt j], c, _) = c (VBool (i = j))
+            | eqOp ([_, _], c, _) = c (VBool false)
+            | eqOp _ = raise (Eval "Arity mismatch")
+          fun nilPredOp ([VNil], c, _) = c (VBool true)
+            | nilPredOp ([_], c, _) = c (VBool false)
+            | nilPredOp _ = raise (Eval "Arity mismatch")
+      in
+          List.map (fn (name, f) => (name, ref (VClos (Primop f)))) [
+            ("+", arithOp op+ op+),
+            ("-", arithOp op- op-),
+            ("*", arithOp op* op*),
+            ("/", divOp),
+            ("car", carOp),
+            ("cdr", cdrOp),
+            ("cons", consOp),
+            ("=", eqOp),
+            ("nil?", nilPredOp)
+          ]
       end
 end
