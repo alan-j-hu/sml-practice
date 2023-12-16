@@ -1,8 +1,4 @@
 structure ThreeCPS = struct
-  datatype empty = Rec of empty
-
-  fun explode (Rec e) = explode e
-
   (* Lexical scope label *)
   type label = int
 
@@ -30,14 +26,22 @@ structure ThreeCPS = struct
 
   fun unCVar (CVar v) = v
 
-  datatype ('lam, 'var) exp = Lam of 'lam | Var of 'var
+  datatype arg
+    = ArgLam of ulam
+    | ArgVar of uvar
+    | ArgInt of int
 
-  datatype ulam = Lambda of label * uvar list * cvar * cvar list * prog
+  and cont
+      = ContLam of clam
+      | ContVar of cvar
+      | ContHalt
+
+  and ulam = Lambda of label * uvar list * cvar * cvar list * prog
   and clam = Cont of label * uvar * prog
 
   and prog
-    = UApp of (ulam, uvar) exp * (ulam, uvar) exp list * (clam, cvar) exp * (clam, cvar) exp list
-    | CApp of (clam, cvar) exp * (ulam, uvar) exp
+    = UApp of arg * arg list * cont * cont list
+    | CApp of cont * arg
     | Letrec of label * (uvar * ulam) list * prog
 
   type hcenv = (label * contour) list
@@ -51,11 +55,17 @@ structure ThreeCPS = struct
     | VNil
     | VBox of value ref
     | VClos of proc
-    | VCont of clam * hcenv * scenv * int
+    | VCont of contproc
 
   and proc
-    = Primop of ((value list * (value -> empty) * (value -> empty) list) -> empty)
+    = Primop of ((value list * (value -> result) * (value -> result) list) -> result)
     | Clos of ulam * hcenv * scenv
+
+  and contproc
+    = Halt
+    | ContClos of clam * hcenv * scenv * int
+
+  and result = Result of value
 
   type frame = (string * value ref) list
 
@@ -99,29 +109,40 @@ structure ThreeCPS = struct
            of SOME (v', rest) => SOME (v', (k, v) :: rest)
             | NONE => NONE
 
-  fun a_u (Lam(ulam), beta, gamma, machine : machine) =
+  fun checkedSub (arr, idx) =
+      let val size = DynamicArray.bound arr in
+      if idx > DynamicArray.bound arr then
+          raise (Eval (String.concat ["Out of bounds ", Int.toString size, " ", Int.toString idx]))
+      else
+          DynamicArray.sub (arr, idx)
+      end
+
+  fun a_u (ArgLam(ulam), beta, gamma, machine : machine) =
       VClos (Clos (ulam, beta, gamma))
-    | a_u (Var(UVar v), beta, gamma, machine) =
-      case #lifetime v
+    | a_u (ArgVar(UVar v), beta, gamma, machine) =
+      (case #lifetime v
        of H =>
-          !(lookup (DynamicArray.sub (#heap machine, lookup (beta, #binder v)), #name v))
+          !(lookup (checkedSub (#heap machine, lookup (beta, #binder v)), #name v))
         | S =>
           !(lookup (Option.valOf (DynamicArray.sub (#stack machine, lookup (gamma, #binder v))), #name v))
         | R =>
-          !(lookup (#registers machine, #name v))
+          !(lookup (#registers machine, #name v)))
+    | a_u (ArgInt n, beta, gamma, machine) = VInt n
 
-  fun a_c (Lam(clam), beta, gamma, machine : machine) =
-      VCont (clam, beta, gamma, DynamicArray.bound (#stack machine) + 1)
-    | a_c (Var(CVar v), beta, gamma, machine) =
-      case #lifetime v
-       of H =>
-          !(lookup (DynamicArray.sub (#heap machine, lookup (beta, #binder v)), #name v))
-        | S =>
-          !(lookup (Option.valOf (DynamicArray.sub (#stack machine, lookup (gamma, #binder v))), #name v))
-        | R =>
-          !(lookup (#registers machine, #name v))
+  fun a_c (ContLam(clam), beta, gamma, machine : machine) =
+      VCont (ContClos (clam, beta, gamma, DynamicArray.bound (#stack machine) + 1))
+    | a_c (ContVar(CVar v), beta, gamma, machine) =
+      (case #lifetime v
+        of H =>
+           !(lookup (DynamicArray.sub (#heap machine, lookup (beta, #binder v)), #name v))
+         | S =>
+           !(lookup (Option.valOf (DynamicArray.sub (#stack machine, lookup (gamma, #binder v))), #name v))
+         | R =>
+           !(lookup (#registers machine, #name v)))
+    | a_c (ContHalt, beta, gamma, machine) = VCont Halt
 
-  fun stackIdx (_, _, _, idx) = idx
+  fun stackIdx (ContClos(_, _, _, idx)) = idx
+    | stackIdx Halt = 0
 
   fun stackTrim (stack, c1, cs) =
       let
@@ -156,7 +177,7 @@ structure ThreeCPS = struct
        of NONE => (var, value) :: overwriteFrame (xs, new)
         | SOME (value', new) => (var, value') :: overwriteFrame (xs, new)
 
-  fun eval (UApp(f, xs, q1, qs), beta, gamma, machine) : empty =
+  fun eval (UApp(f, xs, q1, qs), beta, gamma, machine) =
     let
         val proc = assert_clos (a_u (f, beta, gamma, machine))
         val args = List.map (fn x => a_u (x, beta, gamma, machine)) xs
@@ -191,6 +212,7 @@ structure ThreeCPS = struct
           val (h, s, r) = splitHSR toUpdate
           val hframe = List.map (fn (v, r, _) => (#name (unUVar v), r)) h
           val beta = (l, contour) :: beta
+          val () = DynamicArray.update(#heap machine, contour, hframe)
           val sframe = List.map (fn (v, r, _) => (#name (unUVar v), r)) s
           val sz = DynamicArray.bound (#stack machine) + 1
           val () = DynamicArray.update (#stack machine, sz, SOME sframe)
@@ -211,7 +233,7 @@ structure ThreeCPS = struct
           eval (tail, beta, gamma, replaceRegs(machine, regs))
       end
 
-  and apply_user (Clos(Lambda(l, xs, k, ks, pr), beta, gamma), args, c, cs, machine) : empty =
+  and apply_user (Clos(Lambda(l, xs, k, ks, pr), beta, gamma), args, c, cs, machine) =
       let
           val contour = fresh_contour machine
           val hframe = makeUFrame (fn H => true | _ => false) (xs, args, k, ks, c, cs)
@@ -233,7 +255,7 @@ structure ThreeCPS = struct
          fn v => apply_cont (c, v, machine),
          List.map (fn c => fn v => apply_cont (c, v, machine)) cs)
 
-  and apply_cont ((Cont(l, x, pr), beta, gamma, tos), arg, machine) : empty =
+  and apply_cont (ContClos(Cont(l, x, pr), beta, gamma, tos), arg, machine) =
       let
           val contour = fresh_contour machine
           val hframe =
@@ -255,8 +277,9 @@ structure ThreeCPS = struct
       in
           eval (pr, beta, gamma, replaceRegs (machine, regs))
       end
+    | apply_cont (Halt, arg, machine) = Result arg
 
-val prelude =
+  val prelude =
       let
           fun arithOp f _ ([VInt i, VInt j], c, _) = c (VInt (f (i, j)))
             | arithOp _ f ([VFloat m, VFloat n], c, _) = c (VFloat (f (m, n)))
@@ -288,6 +311,10 @@ val prelude =
           fun nilPredOp ([VNil], c, _) = c (VBool true)
             | nilPredOp ([_], c, _) = c (VBool false)
             | nilPredOp _ = raise (Eval "Arity mismatch")
+
+          fun ifOp ([VBool true], c, _) = c VNil
+            | ifOp ([VBool false], _, [c]) = c VNil
+            | ifOp _ = raise (Eval "Arity mismatch")
       in
           List.map (fn (name, f) => (name, ref (VClos (Primop f)))) [
             ("+", arithOp op+ op+),
@@ -298,7 +325,23 @@ val prelude =
             ("cdr", cdrOp),
             ("cons", consOp),
             ("=", eqOp),
-            ("nil?", nilPredOp)
+            ("nil?", nilPredOp),
+            ("if", ifOp)
           ]
+      end
+
+  fun evalPrelude prog =
+      let
+          val beta = [(~1, 0)]
+          val gamma = []
+          val machine =
+              {
+                gen_contour = ref 1,
+                registers = [],
+                stack = DynamicArray.fromList ([], NONE),
+                heap = DynamicArray.fromList ([prelude], [])
+              }
+      in
+          eval (prog, beta, gamma, machine)
       end
 end
